@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <img alt="Rust" src="https://emblem.xdan.cc/badge.svg?label=rust&amp;message=2021&amp;look=connected&amp;labelColor=%233D3D3D&amp;color=%23FDD017">
-  <img alt="Platform" src="https://emblem.xdan.cc/badge.svg?label=platform&amp;message=Linux&amp;look=connected&amp;labelColor=%233D3D3D&amp;color=%23FDD017">
-  <img alt="License" src="https://emblem.xdan.cc/badge.svg?label=license&amp;message=MIT&amp;look=connected&amp;labelColor=%233D3D3D&amp;color=%23FDD017">
+  <img alt="Rust" src="https://emblem.xdan.cc/badge.svg?label=rust&amp;message=2021&amp;look=connected&amp;labelColor=%233D3D3D&amp;color=%23FDD017&amp;icon=rust">
+  <img alt="Platform" src="https://emblem.xdan.cc/badge.svg?label=platform&amp;message=Linux&amp;look=connected&amp;labelColor=%233D3D3D&amp;color=%23FDD017&amp;icon=linux">
+  <img alt="License" src="https://emblem.xdan.cc/badge.svg?label=license&amp;message=MIT&amp;look=connected&amp;labelColor=%233D3D3D&amp;color=%23FDD017&amp;icon=material-symbols:license">
 </p>
 
 ---
