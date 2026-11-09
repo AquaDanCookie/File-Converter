@@ -15,6 +15,10 @@
   <img alt="License" src="https://emblem.xdan.cc/badge.svg?label=license&amp;message=MIT&amp;look=connected&amp;labelColor=%233D3D3D&amp;color=%23FDD017&amp;icon=material-symbols:license">
 </p>
 
+<p align="center">
+  <img src="screenshots/File-Converter.png" alt="File Converter main window">
+</p>
+
 ---
 
 ## Features
