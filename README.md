@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/fileconverter-128.png" width="112" alt="File Converter icon">
+  <img src="assets/fileconverter-128.png?v=2" width="112" alt="File Converter icon">
 </p>
 
 <h1 align="center">File Converter</h1>
@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="screenshots/File-Converter.png" alt="File Converter main window">
+  <img src="screenshots/File-Converter.png?v=2" alt="File Converter main window">
 </p>
 
 ---
