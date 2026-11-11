@@ -43,6 +43,7 @@ struct ConverterApp {
     store: PresetStore,
     files: Vec<FileEntry>,
     selected: usize,
+    output_dir: Option<PathBuf>,
 
     targets: Vec<String>,
     target_cats: BTreeMap<String, Vec<&'static str>>,
@@ -87,6 +88,7 @@ impl ConverterApp {
             store: PresetStore::load(),
             files: Vec::new(),
             selected: 0,
+            output_dir: None,
             targets: Vec::new(),
             target_cats: BTreeMap::new(),
             target: String::new(),
@@ -177,6 +179,33 @@ impl ConverterApp {
             .pick_files()
         {
             self.add_files(paths);
+        }
+    }
+
+    fn choose_output_dir(&self, title: &str) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        if let Some(directory) = self
+            .output_dir
+            .as_ref()
+            .filter(|directory| directory.is_dir())
+            .cloned()
+            .or_else(dirs::download_dir)
+            .or_else(dirs::home_dir)
+        {
+            dialog = dialog.set_directory(directory);
+        }
+        dialog.pick_folder()
+    }
+
+    fn pick_output_dir(&mut self) {
+        if let Some(directory) = self.choose_output_dir("Choose output folder") {
+            self.output_dir = Some(directory);
+        }
+    }
+
+    fn start_one_time(&mut self) {
+        if let Some(directory) = self.choose_output_dir("Convert to folder") {
+            self.start_with_outdir(Some(directory));
         }
     }
 
@@ -415,6 +444,10 @@ impl ConverterApp {
     // ------------------------------------------------------------- actions
 
     fn start(&mut self) {
+        self.start_with_outdir(None);
+    }
+
+    fn start_with_outdir(&mut self, one_time_outdir: Option<PathBuf>) {
         if self.target.is_empty() {
             self.dialog = Some(PendingDialog {
                 title: "File Converter".into(),
@@ -422,6 +455,21 @@ impl ConverterApp {
                 level: rfd::MessageLevel::Info,
             });
             return;
+        }
+
+        let outdir = one_time_outdir.or_else(|| self.output_dir.clone());
+        if let Some(directory) = &outdir {
+            if !directory.is_dir() {
+                self.dialog = Some(PendingDialog {
+                    title: "File Converter".into(),
+                    text: format!(
+                        "The output folder no longer exists:\n{}",
+                        directory.display()
+                    ),
+                    level: rfd::MessageLevel::Warning,
+                });
+                return;
+            }
         }
 
         let target = self.target.clone();
@@ -445,7 +493,7 @@ impl ConverterApp {
                     target: target.clone(),
                     category: category.to_string(),
                     options: options.clone(),
-                    outdir: None,
+                    outdir: outdir.clone(),
                 }),
             }
         }
@@ -971,6 +1019,36 @@ impl ConverterApp {
                 ui.weak(&self.status);
             }
             ui.horizontal(|ui| {
+                ui.label("Save to:");
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Output folder..."))
+                    .on_hover_text("Choose where converted files are written")
+                    .clicked()
+                {
+                    self.pick_output_dir();
+                }
+                if self.output_dir.is_some()
+                    && ui
+                        .add_enabled(!self.busy, egui::Button::new("Reset"))
+                        .on_hover_text("Save next to each source file")
+                        .clicked()
+                {
+                    self.output_dir = None;
+                }
+                let destination = self
+                    .output_dir
+                    .as_deref()
+                    .map(display_dir)
+                    .unwrap_or_else(|| "Same folder as source".into());
+                let response = ui.add(
+                    egui::Label::new(egui::RichText::new(destination.as_str()).monospace())
+                        .truncate(),
+                );
+                if self.output_dir.is_some() {
+                    response.on_hover_text(destination);
+                }
+            });
+            ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
                         !self.busy && !self.targets.is_empty(),
@@ -979,6 +1057,18 @@ impl ConverterApp {
                     .clicked()
                 {
                     self.start();
+                }
+                if ui
+                    .add_enabled(
+                        !self.busy && !self.targets.is_empty(),
+                        egui::Button::new("Convert to folder..."),
+                    )
+                    .on_hover_text(
+                        "Choose a folder and convert immediately; does not change Save to",
+                    )
+                    .clicked()
+                {
+                    self.start_one_time();
                 }
                 if ui
                     .add_enabled(self.busy, egui::Button::new("Cancel"))
@@ -1032,6 +1122,18 @@ impl eframe::App for ConverterApp {
         egui::CentralPanel::default().show(ctx, |_ui| {});
         self.flush_dialog();
     }
+}
+
+fn display_dir(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".into();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
 }
 
 fn max_size_row(ui: &mut egui::Ui, value: &mut String) {
