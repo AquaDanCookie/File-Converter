@@ -1,6 +1,6 @@
 [package]
 name = "fileconverter"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 description = "Convert and compress audio, video, image and document files"
 license = "MIT"

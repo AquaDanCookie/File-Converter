@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="screenshots/File-Converter.png?v=2" alt="File Converter main window">
+  <img src="screenshots/File-Converter.png?v=3" alt="File Converter main window">
 </p>
 
 ---
@@ -28,6 +28,8 @@
   file list, media information, progress, and cancellation.
 - **Command-line interface** for scripts and headless conversions.
 - **Batch processing** with configurable parallelism.
+- **Output folder control** for choosing a destination for every conversion,
+  plus a one-time "Convert to folder..." action.
 - **Automatic quality matching**:
   - Audio bitrate is matched to each source file.
   - WAV/PCM files work even when `ffprobe` omits the stream bitrate.
