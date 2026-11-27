@@ -967,8 +967,9 @@ impl ConverterApp {
                          enforced for lossy targets; FLAC/WAV cannot be shrunk."
                     }
                     "video" => {
-                        "Adaptive (CRF) keeps quality constant; constant \
-                         bitrate caps the size."
+                        "Adaptive (CRF) keeps quality constant. With a Max File \
+                         Size set, video and audio are compressed together in two \
+                         passes to fit under the cap without dropping frames."
                     }
                     "image" => {
                         "Scale 100% keeps the original size. With a Max File \

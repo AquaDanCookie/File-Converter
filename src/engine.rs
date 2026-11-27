@@ -68,7 +68,9 @@ pub const VIDEO_PRESETS: &[&str] = &[
 ];
 
 /// Extra room reserved for container headers, tags, and encoder rounding.
-const SIZE_HEADROOM: f64 = 0.92;
+/// Two-pass encoding keeps the actual bitrate close to the target, so this
+/// only needs to cover the muxing overhead.
+const SIZE_HEADROOM: f64 = 0.97;
 
 const DEPENDENCIES: &[(&str, &[&str])] = &[
     ("ffmpeg", &["ffmpeg", "ffprobe"]),
@@ -619,9 +621,11 @@ fn ffmpeg_progress_feed<'a>(
     progress: &'a ProgressFn,
     name: &str,
     duration: Option<f64>,
+    range: (f64, f64),
 ) -> impl Fn(String) + Send + Sync + 'a {
     let name = name.to_string();
     let last = Arc::new(Mutex::new(0.0f64));
+    let (start, end) = range;
     move |line| {
         let value = if let Some(rest) = line.strip_prefix("out_time_us=") {
             rest.trim().parse::<f64>().ok().map(|us| us / 1000.0)
@@ -637,9 +641,10 @@ fn ffmpeg_progress_feed<'a>(
             return;
         };
         if let Some(duration) = duration.filter(|duration| *duration > 0.0) {
-            let pct = (current / duration * 100.0).clamp(0.0, 100.0);
+            let fraction = (current / duration).clamp(0.0, 1.0);
+            let pct = (start + fraction * (end - start)).clamp(0.0, 100.0);
             let mut last = last.lock().unwrap();
-            if pct - *last >= 1.0 || pct >= 100.0 {
+            if pct - *last >= 1.0 || (fraction >= 1.0 && pct > *last) {
                 *last = pct;
                 progress(pct, format!("{name}: {pct:.0}%"));
             }
@@ -825,18 +830,40 @@ struct VideoRatePlan {
     audio_kbps: u32,
 }
 
-/// Divide a video budget between video and audio. The share given to audio is
-/// deliberately small; the video stream is what the viewer notices most.
+/// Audio bitrate used when no size limit is set.
+fn default_video_audio_kbps(source: &Path, target: &str) -> u32 {
+    let ceiling = match target {
+        "webm" => 128,
+        "ogv" => 128,
+        "avi" => 128,
+        _ => 192,
+    };
+    let source_kbps = probe::audio_bitrate_bps(source)
+        .map(|bps| (bps / 1000.0).ceil() as u32)
+        .unwrap_or(ceiling);
+    source_kbps.clamp(48, ceiling)
+}
+
+/// Divide a video budget between video and audio.
+///
+/// The audio share scales with the total budget but is capped at a sane
+/// maximum, so a short high-bitrate clip gets good audio while a long clip
+/// does not waste most of its bytes on sound.
 fn video_rate_plan(source: &Path, target: &str, options: &Options) -> ConvResult<VideoRatePlan> {
+    let (has_video, has_audio) = probe::probe_streams(source);
+    if has_video == Some(false) {
+        return Err(ConvError::Message("source has no video stream".into()));
+    }
+    let has_audio = has_audio.unwrap_or(true);
+
     let Some(max_size) = options.max_size.filter(|size| *size > 0.0) else {
-        let audio_kbps = match target {
-            "webm" => 64,
-            "ogv" => 128,
-            _ => 192,
-        };
         return Ok(VideoRatePlan {
             video_kbps: options.vbitrate,
-            audio_kbps,
+            audio_kbps: if has_audio {
+                default_video_audio_kbps(source, target)
+            } else {
+                0
+            },
         });
     };
     let Some(raw_budget) = size_budget_kbps(source, max_size) else {
@@ -844,16 +871,27 @@ fn video_rate_plan(source: &Path, target: &str, options: &Options) -> ConvResult
             "cannot enforce Max File Size: source duration is unknown".into(),
         ));
     };
-    let budget = raw_budget * 0.90;
+    let budget = raw_budget * SIZE_HEADROOM;
     let audio_min = match target {
-        "webm" => 6.0,
+        "webm" => 12.0,
         "ogv" => 48.0,
         "avi" => 32.0,
         "mp4" | "mkv" => 16.0,
         _ => 8.0,
     };
-    let audio_kbps = (budget * 0.20).clamp(audio_min, 192.0).floor() as u32;
     let video_min = 8.0;
+
+    let audio_kbps = if has_audio {
+        let mut audio = (budget * 0.18).clamp(audio_min, 192.0);
+        if let Some(source_kbps) = probe::audio_bitrate_bps(source).map(|bps| bps / 1000.0) {
+            // Do not spend far more on audio than the source itself contains.
+            audio = audio.min((source_kbps * 1.5).max(audio_min));
+        }
+        audio.floor() as u32
+    } else {
+        0
+    };
+
     if budget < audio_kbps as f64 + video_min {
         return Err(ConvError::Message(format!(
             "cannot fit under {} MB: {} is too long for the lowest video bitrate",
@@ -943,6 +981,7 @@ fn build_video_cmd(
     output: &Path,
     target: &str,
     options: &Options,
+    pass_log: Option<(&Path, u32)>,
 ) -> ConvResult<Vec<String>> {
     let preset = options
         .preset
@@ -953,6 +992,7 @@ fn build_video_cmd(
     let rates = video_rate_plan(source, target, options)?;
     let vbitrate = rates.video_kbps;
     let audio_kbps = rates.audio_kbps;
+    let first_pass = pass_log.map(|(_, number)| number == 1).unwrap_or(false);
 
     let rate_arg = if let Some(bitrate) = vbitrate {
         vec!["-b:v".to_string(), format!("{}k", bitrate.max(8))]
@@ -988,48 +1028,6 @@ fn build_video_cmd(
         return Ok(cmd);
     }
 
-    let sample_rate = if audio_kbps < 32 && matches!(target, "mp4" | "mkv") {
-        Some(
-            options
-                .sample_rate
-                .filter(|rate| *rate <= 24_000)
-                .unwrap_or(22_050),
-        )
-    } else {
-        options.sample_rate
-    };
-    if let Some(sample_rate) = sample_rate {
-        let rate = if target == "webm" {
-            libopus_rate(sample_rate)
-        } else {
-            sample_rate
-        };
-        cmd.extend(["-ar".into(), rate.to_string()]);
-    }
-
-    let vp9 = [
-        "-deadline",
-        if preset == "fast" || preset == "faster" || preset == "veryfast" {
-            "realtime"
-        } else if preset == "slower" || preset == "veryslow" {
-            "best"
-        } else {
-            "good"
-        },
-        "-cpu-used",
-        match preset.as_str() {
-            "ultrafast" => "8",
-            "superfast" => "6",
-            "veryfast" => "5",
-            "faster" => "4",
-            "fast" => "2",
-            "medium" => "1",
-            "slow" => "0",
-            "slower" => "1",
-            _ => "0",
-        },
-    ];
-
     match target {
         "mp4" => {
             cmd.extend(["-c:v".into(), "libx264".into()]);
@@ -1039,25 +1037,12 @@ fn build_video_cmd(
                 preset.clone(),
                 "-pix_fmt".into(),
                 "yuv420p".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                format!("{audio_kbps}k"),
-                "-movflags".into(),
-                "+faststart".into(),
             ]);
         }
         "mkv" => {
             cmd.extend(["-c:v".into(), "libx264".into()]);
             cmd.extend(rate_arg);
-            cmd.extend([
-                "-preset".into(),
-                preset.clone(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                format!("{audio_kbps}k"),
-            ]);
+            cmd.extend(["-preset".into(), preset.clone()]);
         }
         "webm" => {
             cmd.extend(["-c:v".into(), "libvpx-vp9".into()]);
@@ -1066,12 +1051,27 @@ fn build_video_cmd(
             } else {
                 cmd.extend(["-crf".into(), crf.to_string(), "-b:v".into(), "0".into()]);
             }
-            cmd.extend(vp9.iter().map(|value| value.to_string()));
+            // "realtime" lets libvpx drop frames when it falls behind, which
+            // shows up as stuttering/cut-outs in an offline conversion. Stay
+            // on the "good" deadline and tune speed with cpu-used instead.
+            let cpu_used = match preset.as_str() {
+                "ultrafast" => "8",
+                "superfast" => "6",
+                "veryfast" => "5",
+                "faster" => "4",
+                "fast" => "3",
+                "medium" => "2",
+                "slow" => "1",
+                "slower" | "veryslow" => "0",
+                _ => "2",
+            };
             cmd.extend([
-                "-c:a".into(),
-                "libopus".into(),
-                "-b:a".into(),
-                format!("{audio_kbps}k"),
+                "-deadline".into(),
+                "good".into(),
+                "-cpu-used".into(),
+                cpu_used.into(),
+                "-row-mt".into(),
+                "1".into(),
             ]);
         }
         "ogv" => {
@@ -1081,12 +1081,6 @@ fn build_video_cmd(
             } else {
                 cmd.extend(["-q:v".into(), quality_from_crf(crf).to_string()]);
             }
-            cmd.extend([
-                "-c:a".into(),
-                "libvorbis".into(),
-                "-b:a".into(),
-                format!("{audio_kbps}k"),
-            ]);
         }
         "avi" => {
             cmd.extend(["-c:v".into(), "mpeg4".into()]);
@@ -1095,18 +1089,64 @@ fn build_video_cmd(
             } else {
                 cmd.extend(["-q:v".into(), quality_from_crf(crf).to_string()]);
             }
-            cmd.extend([
-                "-c:a".into(),
-                "libmp3lame".into(),
-                "-b:a".into(),
-                format!("{audio_kbps}k"),
-            ]);
         }
         _ => {
             return Err(ConvError::Message(format!(
                 "unsupported video target: {target}"
             )))
         }
+    }
+
+    if let Some((log, number)) = pass_log {
+        cmd.extend([
+            "-pass".into(),
+            number.to_string(),
+            "-passlogfile".into(),
+            log.to_string_lossy().into(),
+        ]);
+        if first_pass {
+            cmd.extend(["-an".into(), "-f".into(), "null".into(), "-".into()]);
+            return Ok(cmd);
+        }
+    }
+
+    if audio_kbps > 0 {
+        let sample_rate = if audio_kbps < 32 && matches!(target, "mp4" | "mkv") {
+            Some(
+                options
+                    .sample_rate
+                    .filter(|rate| *rate <= 24_000)
+                    .unwrap_or(22_050),
+            )
+        } else {
+            options.sample_rate
+        };
+        if let Some(sample_rate) = sample_rate {
+            let rate = if target == "webm" {
+                libopus_rate(sample_rate)
+            } else {
+                sample_rate
+            };
+            cmd.extend(["-ar".into(), rate.to_string()]);
+        }
+
+        let audio_codec = match target {
+            "mp4" | "mkv" => "aac",
+            "webm" => "libopus",
+            "ogv" => "libvorbis",
+            "avi" => "libmp3lame",
+            _ => "aac",
+        };
+        cmd.extend([
+            "-c:a".into(),
+            audio_codec.into(),
+            "-b:a".into(),
+            format!("{audio_kbps}k"),
+        ]);
+    }
+
+    if target == "mp4" {
+        cmd.extend(["-movflags".into(), "+faststart".into()]);
     }
 
     cmd.push(output.to_string_lossy().into());
@@ -1129,6 +1169,7 @@ fn convert_audio_to(
             .to_string_lossy()
             .as_ref(),
         duration,
+        (0.0, 100.0),
     );
     let cmd = build_audio_cmd(&job.source, output, &job.target, options)?;
     if let Err(error) = run_process(&cmd, Some(&feed), cancel, None) {
@@ -1160,19 +1201,47 @@ fn convert_video_to(
         return Err(ConvError::Message("source has no video stream".into()));
     }
     let duration = probe::duration_ms(&job.source);
-    let feed = ffmpeg_progress_feed(
-        progress,
-        job.source
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .as_ref(),
-        duration,
-    );
-    let cmd = build_video_cmd(&job.source, output, &job.target, options)?;
-    if let Err(error) = run_process(&cmd, Some(&feed), cancel, None) {
-        let _ = fs::remove_file(output);
-        return Err(error);
+    let name = job
+        .source
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let rates = video_rate_plan(&job.source, &job.target, options)?;
+    let two_pass = rates.video_kbps.is_some()
+        && job.target != "gif"
+        && matches!(job.target.as_str(), "mp4" | "mkv" | "webm" | "ogv" | "avi");
+
+    if two_pass {
+        // Bitrate-targeted jobs use two passes so the encoder can distribute
+        // the available bits across the whole clip instead of starving
+        // difficult scenes (which looks like pulsing or dropped detail).
+        let temp = tempfile::Builder::new()
+            .prefix("fileconverter-pass-")
+            .tempdir()
+            .map_err(|error| ConvError::Message(error.to_string()))?;
+        let log = temp.path().join("ffmpeg-pass");
+
+        let first = ffmpeg_progress_feed(progress, &name, duration, (0.0, 50.0));
+        let cmd = build_video_cmd(&job.source, output, &job.target, options, Some((&log, 1)))?;
+        if let Err(error) = run_process(&cmd, Some(&first), cancel, None) {
+            let _ = fs::remove_file(output);
+            return Err(error);
+        }
+
+        let second = ffmpeg_progress_feed(progress, &name, duration, (50.0, 100.0));
+        let cmd = build_video_cmd(&job.source, output, &job.target, options, Some((&log, 2)))?;
+        if let Err(error) = run_process(&cmd, Some(&second), cancel, None) {
+            let _ = fs::remove_file(output);
+            return Err(error);
+        }
+    } else {
+        let feed = ffmpeg_progress_feed(progress, &name, duration, (0.0, 100.0));
+        let cmd = build_video_cmd(&job.source, output, &job.target, options, None)?;
+        if let Err(error) = run_process(&cmd, Some(&feed), cancel, None) {
+            let _ = fs::remove_file(output);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -1628,10 +1697,23 @@ fn enforce_size_limit(
             }
         }
         "video" => {
-            for factor in [0.85_f64, 0.65, 0.45] {
+            if job.target == "gif" {
+                return Err(ConvError::Message(format!(
+                    "could not fit GIF under {} MB: GIF output has no bitrate control; \
+                     lower the frame rate or resolution first",
+                    format_number(limit / 1_000_000.0)
+                )));
+            }
+            let mut current_max = original_max;
+            for _ in 0..3 {
+                // Scale the budget by how far the encoder overshot instead of
+                // dropping straight to a much lower quality.
+                let ratio = ((limit * 0.985) / size as f64).clamp(0.10, 0.98);
+                current_max *= ratio;
                 let mut retry = job.options.clone();
-                retry.max_size = Some((original_max * factor).max(0.000_001));
+                retry.max_size = Some(current_max.max(0.000_001));
                 retry.vbitrate = None;
+                retry.crf = None;
                 convert_video_to(job, output, &retry, progress, cancel)?;
                 size = output_size(output)?;
                 if size as f64 <= limit {
@@ -1868,5 +1950,45 @@ mod tests {
         assert_eq!(audio_size_plan(source, "flac", &options).unwrap(), None);
         assert_eq!(audio_size_plan(source, "wav", &options).unwrap(), None);
         assert!(audio_size_plan(source, "mp3", &options).is_err());
+    }
+
+    #[test]
+    fn video_two_pass_uses_passlog_and_null_first_pass() {
+        let source = Path::new("/tmp/nonexistent-video.mp4");
+        let output = Path::new("/tmp/output.mp4");
+        let log = Path::new("/tmp/ffmpeg-pass");
+        let options = Options {
+            vbitrate: Some(1_000),
+            ..Options::default()
+        };
+
+        let first = build_video_cmd(source, output, "mp4", &options, Some((log, 1))).unwrap();
+        assert!(first.windows(2).any(|pair| pair == ["-pass", "1"]));
+        assert!(first
+            .windows(2)
+            .any(|pair| pair == ["-passlogfile", "/tmp/ffmpeg-pass"]));
+        assert!(first.windows(2).any(|pair| pair == ["-f", "null"]));
+        assert!(first.iter().any(|arg| arg == "-an"));
+
+        let second = build_video_cmd(source, output, "mp4", &options, Some((log, 2))).unwrap();
+        assert!(second.windows(2).any(|pair| pair == ["-pass", "2"]));
+        assert!(!second.iter().any(|arg| arg == "-an"));
+        assert!(second.iter().any(|arg| arg == "+faststart"));
+        assert!(second.iter().any(|arg| arg == "aac"));
+    }
+
+    #[test]
+    fn webm_never_uses_frame_dropping_realtime_deadline() {
+        let source = Path::new("/tmp/nonexistent-video.mp4");
+        let output = Path::new("/tmp/output.webm");
+        let options = Options {
+            vbitrate: Some(1_000),
+            preset: Some("faster".into()),
+            ..Options::default()
+        };
+
+        let cmd = build_video_cmd(source, output, "webm", &options, None).unwrap();
+        assert!(cmd.windows(2).any(|pair| pair == ["-deadline", "good"]));
+        assert!(!cmd.iter().any(|arg| arg == "realtime"));
     }
 }

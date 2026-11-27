@@ -221,8 +221,11 @@ Notes:
   output is accepted when it already fits; if it is over the limit, the app
   reports an error because lossless output cannot be shrunk by lowering a
   bitrate.
-- Video: the total budget is split between video and audio. MP4, MKV, and WebM
-  work with the size-fitting logic.
+- Video: the total budget is split between video and audio, and the result is
+  encoded in two passes so the available bits are spread evenly across the
+  whole clip. Frame dropping is disabled, so the output does not develop
+  stutters or cut-outs. MP4, MKV, WebM, OGV, and AVI work with the
+  size-fitting logic.
 - Images: quality and scale are reduced as needed.
 - PDF: Ghostscript is required to shrink PDFs. If it cannot reach the requested
   size, the conversion fails instead of leaving an oversized PDF.
